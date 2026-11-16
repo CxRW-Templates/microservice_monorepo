@@ -138,10 +138,10 @@ jobs:
         run: ls -la "${{ matrix.folder }}"
 
       - name: Checkmarx One Action
-        # Replace @main with a release tag or commit SHA so scans are repeatable.
-        # This SHA is v2.0.25 per the Checkmarx/2ms repository. Check the action's
-        # releases page for the current version before using it.
-        uses: checkmarx/ast-github-action@dd0f9365942f29a99c3be5bdb308958ede8f906b
+        # Pinned to the full commit SHA of release 2.3.47 (short SHA 58c998c)
+        # instead of @main so scans are repeatable. Verify the SHA against the
+        # release page before relying on it.
+        uses: checkmarx/ast-github-action@58c998c5d78b3ecfa51e7cbde852d5565d5dea0b # 2.3.47
         with:
           base_uri: https://${{ secrets.REGION }}.checkmarx.net
           cx_tenant: ${{ secrets.TENANT }}
