@@ -1,65 +1,147 @@
 name: Checkmarx One Security Scan
 
+# -----------------------------------------------------------------------------
+# DEMO NOTES
+# The original workflow scanned all 7 services on every push and pull request.
+# This version scans only the services that changed, which cuts scan time and
+# Checkmarx One scan usage for a monorepo. The structure is:
+#   1. detect-changes: works out which service folders changed.
+#   2. checkmarx-scan: runs one scan per changed folder, in parallel.
+# -----------------------------------------------------------------------------
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
+  workflow_dispatch:   # Manual runs scan every service (see detect-changes).
 
+# Least-privilege token permissions. "pull-requests: write" is kept from the
+# original workflow. Remove it if you do not use pull request feedback.
 permissions:
   contents: read
   pull-requests: write
-  
+
+# Cancel an in-progress run when a newer commit is pushed to the same pull
+# request. Runs on main are never canceled, so every merge is scanned.
+concurrency:
+  group: checkmarx-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  checkmarx-scan:
+  # ---------------------------------------------------------------------------
+  # JOB 1: Decide which service folders need a scan.
+  # ---------------------------------------------------------------------------
+  detect-changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      # A JSON array of folders, for example ["analytics/data-collector"].
+      folders: ${{ steps.detect.outputs.folders }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4   # Pinned to a major version instead of @main.
+        with:
+          fetch-depth: 0            # Full history so git diff can see the base commit.
+
+      - name: Detect changed service folders
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Single source of truth for the list of services.
+          FOLDERS=(
+            e-commerce/product-catalog
+            e-commerce/payment-processor
+            e-commerce/user-authentication
+            analytics/data-collector
+            analytics/report-generator
+            infrastructure/service-registry
+            infrastructure/config-manager
+          )
+
+          # Pick the commit to compare against, based on the trigger.
+          case "$EVENT_NAME" in
+            pull_request) BASE="$PR_BASE_SHA" ;;
+            push)         BASE="$PUSH_BEFORE_SHA" ;;
+            *)            BASE="" ;;   # workflow_dispatch has no base commit.
+          esac
+
+          SELECTED=()
+          ZERO_SHA="0000000000000000000000000000000000000000"
+
+          # Fall back to scanning everything when there is no usable base commit
+          # (manual run, new branch, or a force push).
+          if [ -z "$BASE" ] || [ "$BASE" = "$ZERO_SHA" ] \
+             || ! CHANGED=$(git diff --name-only "$BASE" HEAD); then
+            echo "No usable base commit. Scanning all folders."
+            SELECTED=("${FOLDERS[@]}")
+          # A change to this workflow file can affect every service, so scan all.
+          elif echo "$CHANGED" | grep -qx '.github/workflows/checkmarx-scan.yml'; then
+            echo "Workflow file changed. Scanning all folders."
+            SELECTED=("${FOLDERS[@]}")
+          else
+            # Keep only the folders that contain at least one changed file.
+            for f in "${FOLDERS[@]}"; do
+              if echo "$CHANGED" | grep -q "^${f}/"; then
+                SELECTED+=("$f")
+              fi
+            done
+          fi
+
+          # Convert the bash array to a JSON array for the matrix in job 2.
+          if [ "${#SELECTED[@]}" -eq 0 ]; then
+            JSON='[]'
+          else
+            JSON=$(printf '%s\n' "${SELECTED[@]}" | jq -R . | jq -sc .)
+          fi
+
+          echo "Folders to scan: $JSON"
+          echo "folders=$JSON" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # JOB 2: Scan each changed folder as its own Checkmarx One project.
+  # ---------------------------------------------------------------------------
+  checkmarx-scan:
+    needs: detect-changes
+    # Skip the job entirely when nothing relevant changed.
+    if: needs.detect-changes.outputs.folders != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
+      fail-fast: false   # One failed scan no longer cancels the other scans.
       matrix:
-        folder:
-          - e-commerce/product-catalog
-          - e-commerce/payment-processor
-          - e-commerce/user-authentication
-          - analytics/data-collector
-          - analytics/report-generator
-          - infrastructure/service-registry
-          - infrastructure/config-manager
-        include:
-          - folder: e-commerce/product-catalog
-            project_name: product-catalog
-            tag: monorepo:product-catalog
-          - folder: e-commerce/payment-processor
-            project_name: payment-processor
-            tag: monorepo:payment-processor
-          - folder: e-commerce/user-authentication
-            project_name: user-authentication
-            tag: monorepo:user-authentication
-          - folder: analytics/data-collector
-            project_name: data-collector
-            tag: monorepo:data-collector
-          - folder: analytics/report-generator
-            project_name: report-generator
-            tag: monorepo:report-generator
-          - folder: infrastructure/service-registry
-            project_name: service-registry
-            tag: monorepo:service-registry
-          - folder: infrastructure/config-manager
-            project_name: config-manager
-            tag: monorepo:config-manager
+        # The matrix is built at runtime from detect-changes. The repeated
+        # "include" block from the original is no longer needed because the
+        # project name and tag are derived from the folder below.
+        folder: ${{ fromJSON(needs.detect-changes.outputs.folders) }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@main
+        uses: actions/checkout@v4   # Pinned to a major version instead of @main.
 
-      - name: List files in workspace
-        run: |
-          echo "Current directory structure:"
-          ls -R
-          echo "Files in target directory:"
-          ls -R ${{ matrix.folder }}
+      # Derive the short service name (for example "product-catalog") used in
+      # the project tag.
+      - name: Derive service name
+        id: svc
+        env:
+          FOLDER: ${{ matrix.folder }}
+        run: echo "name=$(basename "$FOLDER")" >> "$GITHUB_OUTPUT"
+
+      # Optional demo step. Lists only the folder being scanned. The original
+      # listed the entire workspace recursively, which added time and log noise.
+      - name: Show folder being scanned
+        run: ls -la "${{ matrix.folder }}"
 
       - name: Checkmarx One Action
-        uses: checkmarx/ast-github-action@main
+        # Replace @main with a release tag or commit SHA so scans are repeatable.
+        # This SHA is v2.0.25 per the Checkmarx/2ms repository. Check the action's
+        # releases page for the current version before using it.
+        uses: checkmarx/ast-github-action@dd0f9365942f29a99c3be5bdb308958ede8f906b
         with:
           base_uri: https://${{ secrets.REGION }}.checkmarx.net
           cx_tenant: ${{ secrets.TENANT }}
@@ -67,7 +149,16 @@ jobs:
           cx_client_secret: ${{ secrets.CLIENT_SECRET }}
           additional_params: >-
             --sast-preset-name 'Base Preset'
-            --output-path .
             -s ${{ matrix.folder }}
             --project-name ${{ matrix.folder }}
-            --project-tags ${{ matrix.tag }} 
+            --project-tags monorepo:${{ steps.svc.outputs.name }}
+            ${{ github.event_name == 'pull_request' && '--sast-incremental' || '' }}
+          # What each parameter does:
+          #   -s                    Scan only this service folder, not the whole repository.
+          #   --project-name        Kept identical to the original workflow so results continue
+          #                         to land in the existing Checkmarx One projects.
+          #   --project-tags        Same tag values as the original (monorepo:<service>).
+          #   --sast-incremental    Pull requests only. Scans only changed code for SAST.
+          #                         Pushes to main still run a full scan.
+          # The original "--output-path ." was removed because no report format was
+          # requested. To produce a report, add "--report-format <format>" back with it.
